@@ -1,0 +1,7 @@
+# googletrans==4.0.2
+deep-translator
+sounddevice==0.5.1
+soundfile==0.13.1
+PySide6==6.9.0
+numpy==1.26.4
+openai-whisper==20240930
