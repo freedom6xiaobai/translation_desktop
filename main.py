@@ -9,7 +9,7 @@ import sounddevice as sd
 import numpy as np
 import wave
 import datetime
-import whisper
+import whisperx
 import tempfile
 import soundfile as sf
 
@@ -21,9 +21,13 @@ from PySide6.QtGui import QCursor
 from PySide6.QtCore import Qt, QCoreApplication, QTimer, QMetaObject, Q_ARG
 from PySide6.QtCore import Slot
 # from googletrans import Translator
-from deep_translator import GoogleTranslator
+# from deep_translator import GoogleTranslator
+from azure_ts import translate_text_azure
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+import warnings
+
+warnings.filterwarnings("ignore", message=".*torchaudio._backend.list_audio_backends.*")
 
 SILENCE_THRESHOLD = 0.01  # 你可根据麦克风灵敏度调整
 silence_duration_limit = 3  # 静音持续3秒才认定为静音
@@ -97,16 +101,22 @@ class MyWidget(QWidget):
         self.fs = 44100  # 采样率
         self.recording_frames = []
         self.record_thread = None
+        self.last_audio_chunk = None  # 用于存储最后一段音频数据
 
-        # 加载模型
+        # whisperx
         self.audio_buffer = deque()
         self.last_trans_time = time.time()
-        self.model = whisper.load_model("small")  # 模型初始化建议单次完成
+        self.model = whisperx.load_model("small", device="cpu", compute_type="int8")
+        print("模型内容：", self.model)
 
         # 逻辑处理线程
         self.stop_transcribe = threading.Event()
         self.transcribe_thread = None
         self.buffer_lock = threading.Lock()
+
+        # 缓存识别文本
+        self.transcribe_cache = []
+        self.cache_max_len = 5
 
         # 计时器
         self.record_seconds = 0
@@ -135,20 +145,20 @@ class MyWidget(QWidget):
         layout.addWidget(self.scroll_area)
 
         # 创建翻译区域
-        self.scroll_area_bottom = QScrollArea()
-        self.scroll_area_bottom.setWidgetResizable(True)
-        self.scroll_area_bottom.setStyleSheet("""
-            padding: 8px;
-            border: 1px solid #DDFF00;
-        """)
-        self.msg_label_bottom = QLabel()
-        self.msg_label_bottom.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.msg_label_bottom.setStyleSheet("border: none;")
-        self.msg_label_bottom.setWordWrap(True)
-        self.msg_label_bottom.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.msg_label_bottom.customContextMenuRequested.connect(self.show_msg_label_bottom_menu)
-        self.scroll_area_bottom.setWidget(self.msg_label_bottom)
-        layout.addWidget(self.scroll_area_bottom)
+        # self.scroll_area_bottom = QScrollArea()
+        # self.scroll_area_bottom.setWidgetResizable(True)
+        # self.scroll_area_bottom.setStyleSheet("""
+        #     padding: 8px;
+        #     border: 1px solid #DDFF00;
+        # """)
+        # self.msg_label_bottom = QLabel()
+        # self.msg_label_bottom.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # self.msg_label_bottom.setStyleSheet("border: none;")
+        # self.msg_label_bottom.setWordWrap(True)
+        # self.msg_label_bottom.setContextMenuPolicy(Qt.CustomContextMenu)
+        # self.msg_label_bottom.customContextMenuRequested.connect(self.show_msg_label_bottom_menu)
+        # self.scroll_area_bottom.setWidget(self.msg_label_bottom)
+        # layout.addWidget(self.scroll_area_bottom)
 
         # 创建底部的录制按钮
         tool_layout = QHBoxLayout()
@@ -191,7 +201,6 @@ class MyWidget(QWidget):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.msg_label.text())
 
-    # msg translate 菜单
     def show_msg_label_bottom_menu(self, pos):
         menu = QMenu()
         copy_all_action = QAction("All Copy", self)
@@ -201,6 +210,8 @@ class MyWidget(QWidget):
         # 在 msg_label 上弹出菜单，pos 是局部坐标
         menu.exec(self.msg_label_bottom.mapToGlobal(pos))
 
+    # msg translate 菜单
+
     def copy_all_msg_label_bottom_text(self):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.msg_label_bottom.text())
@@ -208,7 +219,7 @@ class MyWidget(QWidget):
     # clear
     def clear_text(self):
         self.msg_label.setText("")
-        self.msg_label_bottom.setText("")
+        # self.msg_label_bottom.setText("")
 
     # 计时器更新
     def update_record_time(self):
@@ -218,38 +229,160 @@ class MyWidget(QWidget):
         seconds = self.record_seconds % 60
         self.record_time_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
+    # 静音检测函数
+    def detect_silence(self, audio_chunk):
+        # 简单能量法检测静音
+        if audio_chunk is None or len(audio_chunk) == 0:
+            return True
+        energy = np.mean(np.abs(audio_chunk))
+        return energy < SILENCE_THRESHOLD
+
+    # 文本相似度判定（简单版：Jaccard/重叠度）
+    def is_similar(self, text1, text2):
+        # 只要有较大重叠就认为重复
+        if not text1 or not text2:
+            return False
+        set1 = set(text1.strip())
+        set2 = set(text2.strip())
+        if not set1 or not set2:
+            return False
+        overlap = len(set1 & set2) / max(len(set1), 1)
+        return overlap > 0.8
+
+    # 合并缓存文本
+    def merge_cache_text(self):
+        # 用 set 去重 + 保留顺序
+        seen = set()
+        merged = []
+        for text in self.transcribe_cache:
+            if text not in seen:
+                seen.add(text)
+                merged.append(text)
+        return "\n".join(merged)
+
+    # 分句函数：按英文标点分句
+    def split_into_sentences(self, text):
+        import re
+        # 按英文句号、问号、感叹号拆分
+        pattern = r'(?<=[.!?])\s+'
+        sentences = re.split(pattern, text.strip())
+        # 去除空句
+        return [s.strip() for s in sentences if s.strip()]
+
+    # 合并唯一且最长表达的句子，去除被包含或重复的句子
+    def merge_unique_sentences(self, sentences):
+        # 保留唯一且最长表达的句子
+        result = []
+        for i, s in enumerate(sentences):
+            is_contained = False
+            for j, t in enumerate(sentences):
+                if i != j and s in t:
+                    is_contained = True
+                    break
+            if not is_contained and s not in result:
+                result.append(s)
+        return result
+
     # 增加临时缓存
     def transcribe_audio_chunk(self, audio_chunk):
         tmp_path = "debug_audio.wav"
+
+        # 检查当前片段是否过短
+        if len(audio_chunk) / self.fs < 2.0 or len(audio_chunk) < self.fs * 2.0:
+            if self.last_audio_chunk is not None:
+                print("⚠️ 当前片段过短，拼接上一段音频增强上下文")
+                audio_chunk = np.concatenate([self.last_audio_chunk, audio_chunk], axis=0)
+
+        self.last_audio_chunk = audio_chunk  # 缓存当前的
+
         sf.write(tmp_path, audio_chunk, self.fs)
         try:
-            result = self.model.transcribe(tmp_path, fp16=False, language='en')
-            result_text = result.get('text', '')
+            result = self.model.transcribe(tmp_path)
+
+            segments = result.get("segments", [])
+            result_text = ""
+            if segments:
+                for segment in segments:
+                    speaker = segment.get("speaker")
+                    text = segment.get("text", "")
+                    if speaker:
+                        result_text += f"[{speaker}] {text}\n"
+                    else:
+                        result_text += f"{text}\n"
+            else:
+                result_text = result.get("text", "")
+            # --- 句子合并逻辑 ---
+            sentences = self.split_into_sentences(result_text)
+            merged_sentences = self.merge_unique_sentences(sentences)
+            result_text = " ".join(merged_sentences)
         except Exception as e:
+            print(f"[转写错误]: {e}")
             result_text = f"[识别失败]: {e}"
         return result_text
 
-    # 线程池
+    # 线程池 识别speaker 内容 实现实时录些
     def transcribe_loop(self):
+        silence_count = 0
+        silence_limit = silence_duration_limit  # 秒
+        silence_chunk_samples = int(self.fs * 0.5)  # 0.5秒为单位检测
+        buffer_chunks = []
+        buffer_duration = 0
         while not self.stop_transcribe.is_set():
-            # print("循环体运行中...")
-            time.sleep(1.5)
             with self.buffer_lock:
-                # print(f"当前音频缓冲区大小：{len(self.audio_buffer)}")
                 if len(self.audio_buffer) == 0:
                     time.sleep(0.1)
                     continue
-                chunks = list(self.audio_buffer)
-                self.audio_buffer.clear()
-                audio_chunk = np.concatenate(chunks, axis=0)
-                duration = len(audio_chunk) / self.fs
-                # print(f"拼接音频长度: {len(audio_chunk)}, 时长: {duration:.2f}s")
-            audio_chunk = audio_chunk.flatten().astype(np.float32)
-            result_text = self.transcribe_audio_chunk(audio_chunk)
-            print("识别结果：", result_text)
 
-            self._pending_result_text = result_text
-            QMetaObject.invokeMethod(self, "call_update_ui", Qt.QueuedConnection)
+                chunks = []
+                total_duration = 0
+                # 收集音频片段，直到累计约0.5秒
+                while self.audio_buffer and total_duration < silence_chunk_samples:
+                    chunk = self.audio_buffer.popleft()
+                    chunks.append(chunk)
+                    total_duration += len(chunk)
+
+            if not chunks:
+                time.sleep(0.2)
+                continue
+
+            audio_chunk = np.concatenate(chunks, axis=0)
+            audio_chunk = audio_chunk.flatten().astype(np.float32)
+            buffer_chunks.append(audio_chunk)
+            buffer_duration += len(audio_chunk)
+
+            # 检查静音
+            if self.detect_silence(audio_chunk):
+                silence_count += 0.5
+            else:
+                silence_count = 0
+
+            # 如果达到缓存上限或者检测到静音持续足够时间，则触发识别
+            if buffer_duration >= self.fs * 5.0 or silence_count >= silence_limit:
+                # 合并缓存
+                full_audio = np.concatenate(buffer_chunks, axis=0)
+                full_audio = full_audio.flatten().astype(np.float32)
+                result_text = self.transcribe_audio_chunk(full_audio)
+                # 判重
+                if self.transcribe_cache:
+                    last_text = self.transcribe_cache[-1]
+                    if self.is_similar(last_text, result_text):
+                        # 跳过重复
+                        buffer_chunks.clear()
+                        buffer_duration = 0
+                        silence_count = 0
+                        continue
+                # 缓存并合并
+                self.transcribe_cache.append(result_text)
+                if len(self.transcribe_cache) > self.cache_max_len:
+                    self.transcribe_cache = self.transcribe_cache[-self.cache_max_len:]
+                merged_text = self.merge_cache_text()
+                print("识别结果（缓存合并）:", merged_text)
+                self._pending_result_text = merged_text
+                QMetaObject.invokeMethod(self, "call_update_ui", Qt.QueuedConnection)
+                # 清空缓存
+                buffer_chunks.clear()
+                buffer_duration = 0
+                silence_count = 0
 
     # 音频转换文本
     def start_transcribe_thread(self, indata=None):
@@ -345,7 +478,8 @@ class MyWidget(QWidget):
         # 在后台线程中执行翻译
         def do_translate(text):
             try:
-                translated = GoogleTranslator(source='auto', target='zh-CN').translate(text)
+                translated = translate_text_azure("hello world")
+                # translated = GoogleTranslator(source='auto', target='zh-CN').translate(text)
                 return translated
                 # translator = Translator()
                 # result = translator.translate(text, src='en', dest='zh-CN')
@@ -375,8 +509,9 @@ class MyWidget(QWidget):
 
 if __name__ == '__main__':
     print("Hello from PyInstaller!")
-    # print(whisper.__file__)          # 检查路径
-    # print(dir(whisper))              # 应该有 load_model
+    print('~/.cache/whisper')
+    print(whisperx.__file__)  # 检查路径
+    print(dir(whisperx))  # 应该有 load_model
     os.environ["PATH"] += os.pathsep + "/opt/homebrew/bin/"  # 替换成你的ffmpeg安装目录
     print("PATH=", os.environ.get("PATH"))
     app = QApplication(sys.argv)
