@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication, QWidget, QLabel, QMainWindow, QVBoxL
     QFileDialog, \
     QMessageBox, QHBoxLayout, QMenu
 from PySide6.QtGui import QCursor
-from PySide6.QtCore import Qt, QCoreApplication, QTimer, QMetaObject, Q_ARG
+from PySide6.QtCore import Qt, QCoreApplication, QTimer, QMetaObject, Q_ARG, Signal
 from PySide6.QtCore import Slot
 # from googletrans import Translator
 # from deep_translator import GoogleTranslator
@@ -27,10 +27,9 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import warnings
 
-warnings.filterwarnings("ignore", message=".*torchaudio._backend.list_audio_backends.*")
+from sentence_former import RealTimeTranscriber
 
-SILENCE_THRESHOLD = 0.01  # 你可根据麦克风灵敏度调整
-silence_duration_limit = 3  # 静音持续3秒才认定为静音
+warnings.filterwarnings("ignore", message=".*torchaudio._backend.list_audio_backends.*")
 
 
 # 主mainwindowffmpeg
@@ -86,12 +85,16 @@ class MyMainWindow(QMainWindow):
 
 
 class MyWidget(QWidget):
+    update_ui_signal = Signal(str)
+
     @Slot()
-    def call_update_ui(self):
-        self.update_ui(self._pending_result_text)
+    def call_update_ui(self,text: str = ""):
+        self.update_ui(text)
 
     def __init__(self, _):
         super().__init__()
+        self.update_ui_signal.connect(self.call_update_ui)
+
         # 静音判断
         self.silence_counter = 0
         self.executor = ThreadPoolExecutor(max_workers=2)
@@ -101,22 +104,20 @@ class MyWidget(QWidget):
         self.fs = 44100  # 采样率
         self.recording_frames = []
         self.record_thread = None
-        self.last_audio_chunk = None  # 用于存储最后一段音频数据
 
         # whisperx
         self.audio_buffer = deque()
         self.last_trans_time = time.time()
-        self.model = whisperx.load_model("small", device="cpu", compute_type="int8")
+        self.model = whisperx.load_model("small", device="cpu", compute_type="int8", language="en")
         print("模型内容：", self.model)
+
+        # 实时转录器
+        self.transcriber = RealTimeTranscriber(self.model,fs=self.fs)
 
         # 逻辑处理线程
         self.stop_transcribe = threading.Event()
         self.transcribe_thread = None
         self.buffer_lock = threading.Lock()
-
-        # 缓存识别文本
-        self.transcribe_cache = []
-        self.cache_max_len = 5
 
         # 计时器
         self.record_seconds = 0
@@ -229,167 +230,15 @@ class MyWidget(QWidget):
         seconds = self.record_seconds % 60
         self.record_time_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
-    # 静音检测函数
-    def detect_silence(self, audio_chunk):
-        # 简单能量法检测静音
-        if audio_chunk is None or len(audio_chunk) == 0:
-            return True
-        energy = np.mean(np.abs(audio_chunk))
-        return energy < SILENCE_THRESHOLD
-
-    # 文本相似度判定（简单版：Jaccard/重叠度）
-    def is_similar(self, text1, text2):
-        # 只要有较大重叠就认为重复
-        if not text1 or not text2:
-            return False
-        set1 = set(text1.strip())
-        set2 = set(text2.strip())
-        if not set1 or not set2:
-            return False
-        overlap = len(set1 & set2) / max(len(set1), 1)
-        return overlap > 0.8
-
-    # 合并缓存文本
-    def merge_cache_text(self):
-        # 用 set 去重 + 保留顺序
-        seen = set()
-        merged = []
-        for text in self.transcribe_cache:
-            if text not in seen:
-                seen.add(text)
-                merged.append(text)
-        return "\n".join(merged)
-
-    # 分句函数：按英文标点分句
-    def split_into_sentences(self, text):
-        import re
-        # 按英文句号、问号、感叹号拆分
-        pattern = r'(?<=[.!?])\s+'
-        sentences = re.split(pattern, text.strip())
-        # 去除空句
-        return [s.strip() for s in sentences if s.strip()]
-
-    # 合并唯一且最长表达的句子，去除被包含或重复的句子
-    def merge_unique_sentences(self, sentences):
-        # 保留唯一且最长表达的句子
-        result = []
-        for i, s in enumerate(sentences):
-            is_contained = False
-            for j, t in enumerate(sentences):
-                if i != j and s in t:
-                    is_contained = True
-                    break
-            if not is_contained and s not in result:
-                result.append(s)
-        return result
-
-    # 增加临时缓存
-    def transcribe_audio_chunk(self, audio_chunk):
-        tmp_path = "debug_audio.wav"
-
-        # 检查当前片段是否过短
-        if len(audio_chunk) / self.fs < 2.0 or len(audio_chunk) < self.fs * 2.0:
-            if self.last_audio_chunk is not None:
-                print("⚠️ 当前片段过短，拼接上一段音频增强上下文")
-                audio_chunk = np.concatenate([self.last_audio_chunk, audio_chunk], axis=0)
-
-        self.last_audio_chunk = audio_chunk  # 缓存当前的
-
-        sf.write(tmp_path, audio_chunk, self.fs)
-        try:
-            result = self.model.transcribe(tmp_path)
-
-            segments = result.get("segments", [])
-            result_text = ""
-            if segments:
-                for segment in segments:
-                    speaker = segment.get("speaker")
-                    text = segment.get("text", "")
-                    if speaker:
-                        result_text += f"[{speaker}] {text}\n"
-                    else:
-                        result_text += f"{text}\n"
-            else:
-                result_text = result.get("text", "")
-            # --- 句子合并逻辑 ---
-            sentences = self.split_into_sentences(result_text)
-            merged_sentences = self.merge_unique_sentences(sentences)
-            result_text = " ".join(merged_sentences)
-        except Exception as e:
-            print(f"[转写错误]: {e}")
-            result_text = f"[识别失败]: {e}"
-        return result_text
-
-    # 线程池 识别speaker 内容 实现实时录些
-    def transcribe_loop(self):
-        silence_count = 0
-        silence_limit = silence_duration_limit  # 秒
-        silence_chunk_samples = int(self.fs * 0.5)  # 0.5秒为单位检测
-        buffer_chunks = []
-        buffer_duration = 0
-        while not self.stop_transcribe.is_set():
-            with self.buffer_lock:
-                if len(self.audio_buffer) == 0:
-                    time.sleep(0.1)
-                    continue
-
-                chunks = []
-                total_duration = 0
-                # 收集音频片段，直到累计约0.5秒
-                while self.audio_buffer and total_duration < silence_chunk_samples:
-                    chunk = self.audio_buffer.popleft()
-                    chunks.append(chunk)
-                    total_duration += len(chunk)
-
-            if not chunks:
-                time.sleep(0.2)
-                continue
-
-            audio_chunk = np.concatenate(chunks, axis=0)
-            audio_chunk = audio_chunk.flatten().astype(np.float32)
-            buffer_chunks.append(audio_chunk)
-            buffer_duration += len(audio_chunk)
-
-            # 检查静音
-            if self.detect_silence(audio_chunk):
-                silence_count += 0.5
-            else:
-                silence_count = 0
-
-            # 如果达到缓存上限或者检测到静音持续足够时间，则触发识别
-            if buffer_duration >= self.fs * 5.0 or silence_count >= silence_limit:
-                # 合并缓存
-                full_audio = np.concatenate(buffer_chunks, axis=0)
-                full_audio = full_audio.flatten().astype(np.float32)
-                result_text = self.transcribe_audio_chunk(full_audio)
-                # 判重
-                if self.transcribe_cache:
-                    last_text = self.transcribe_cache[-1]
-                    if self.is_similar(last_text, result_text):
-                        # 跳过重复
-                        buffer_chunks.clear()
-                        buffer_duration = 0
-                        silence_count = 0
-                        continue
-                # 缓存并合并
-                self.transcribe_cache.append(result_text)
-                if len(self.transcribe_cache) > self.cache_max_len:
-                    self.transcribe_cache = self.transcribe_cache[-self.cache_max_len:]
-                merged_text = self.merge_cache_text()
-                print("识别结果（缓存合并）:", merged_text)
-                self._pending_result_text = merged_text
-                QMetaObject.invokeMethod(self, "call_update_ui", Qt.QueuedConnection)
-                # 清空缓存
-                buffer_chunks.clear()
-                buffer_duration = 0
-                silence_count = 0
-
     # 音频转换文本
     def start_transcribe_thread(self, indata=None):
         print("启动转录线程")
         self.stop_transcribe.clear()
         if not self.transcribe_thread or not self.transcribe_thread.is_alive():
-            self.transcribe_thread = threading.Thread(target=self.transcribe_loop)
+            self.transcribe_thread = threading.Thread(
+                target=self.transcriber.transcribe_loop,
+                args=(self.audio_buffer, self.stop_transcribe, self.buffer_lock, self)
+            )
             self.transcribe_thread.daemon = True
             self.transcribe_thread.start()
 
